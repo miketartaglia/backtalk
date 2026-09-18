@@ -31,10 +31,17 @@ session" / "compact the session" / "switch to the deep model" / "back
 to the fast model" / "set effort to low" (or medium, high, max) /
 "usage report" / "go hands free" and "push to talk mode" (the MIC) /
 "stop asking for permission" and "start asking again" (permissions,
-called auto-approve, a different axis than the microphone on purpose).
-And with permission_mode "ask" (the default), gated tool calls ASK OUT
-LOUD and your spoken yes or no decides them; any other answer is
-passed back to the agent as the reason.
+called auto-approve, a different axis than the microphone on purpose) /
+"switch to air pods" and "switch to speakers" (moves the VOICE's output
+to a different device live, no restart). And with permission_mode
+"ask" (the default), gated tool calls ASK OUT LOUD and your spoken yes
+or no decides them; any other answer is passed back to the agent as
+the reason.
+
+THE PAUSE KEY (config.py's pause_key, cmd_r/right-Command by default):
+a separate key from the talk key. Press once to pause the voice
+mid-reply, press again to resume exactly where it held — nothing
+queued or in-progress is thrown away, unlike the talk key's interrupt.
 
 Flags:
   --open-mic   start in hands-free listening for this session (the
@@ -65,6 +72,7 @@ from backtalk import signals
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
+                           switch_device as ears_switch_device,
                            warm as warm_ears)
 from backtalk.mouth import Mouth
 from backtalk.ptt import PTTListener
@@ -325,6 +333,8 @@ CONSOLE_VERBS = {
                   "auto approve mode"),
     "ask":       ("start asking again", "ask before acting",
                   "ask for permission again"),
+    "speaker_airpods": ("switch to air pods",),
+    "speaker_default": ("switch to speakers",),
 }
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
@@ -843,6 +853,31 @@ async def amain():
                 mouth.say("I saved asking as your default, but this "
                           "session couldn't switch over. Restart the "
                           "voice line to get asking back.")
+        elif verb in ("speaker_airpods", "speaker_default"):
+            resp = ""
+            query = "air pods" if verb == "speaker_airpods" else "speakers"
+            # Mouth's switch runs FIRST: it's the one that rescans devices
+            # (sd._terminate()/_initialize(), needed to see a just-paired
+            # Bluetooth device), and ears' switch deliberately skips that
+            # rescan to avoid invalidating the output stream mouth just
+            # opened. Order matters — see ears.switch_device's docstring.
+            out_found, out_name = await loop.run_in_executor(
+                None, mouth.switch_device, query)
+            in_found, in_name = await loop.run_in_executor(
+                None, ears_switch_device, query)
+            if out_found and in_found:
+                mouth.say(f"Switched to {out_name}, mic included.")
+            elif out_found:
+                mouth.say(f"Switched speaker output to {out_name}, but "
+                          "couldn't find a matching microphone — mic "
+                          "unchanged.")
+            elif in_found:
+                mouth.say(f"Switched the microphone to {in_name}, but "
+                          "couldn't find a matching speaker — output "
+                          "unchanged.")
+            else:
+                mouth.say(f"Couldn't find {query} — staying on the "
+                          "system default.")
         else:
             resp = ""
         if say_after:
@@ -944,7 +979,8 @@ async def amain():
         # in "open" mode; a mode switch bumps _MIC["gen"], the abort
         # callable closes the in-flight open mic promptly, and any
         # capture born under an old gen is discarded unprocessed.
-        ptt = PTTListener(CFG["ptt_key"])
+        ptt = PTTListener(CFG["ptt_key"], pause_key=CFG.get("pause_key"),
+                         on_pause_toggle=mouth.toggle_pause)
         press_fut: asyncio.Future | None = None
         mic_fut: asyncio.Future | None = None
         mic_gen_seen = _MIC["gen"]

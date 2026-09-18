@@ -89,6 +89,14 @@ DEFAULTS = {
     # Hold-to-talk key. Named keys ("home", "f13", "right_alt", ...)
     # or a single character.
     "ptt_key": "home",
+    # Second, independent key: a press toggles pause/resume on whatever
+    # is currently speaking (or about to). Unlike the talk key's
+    # interrupt, nothing is thrown away -- the queue and the
+    # in-progress sentence both survive and pick up exactly where they
+    # held. Deliberately a SEPARATE key from ptt_key, so pausing can
+    # never double as an interrupt. cmd_r (right Command) exists on
+    # every Mac keyboard and does nothing on its own.
+    "pause_key": "cmd_r",
     # The microphone mode. "ptt" (push to talk, the default and the
     # recommendation): the mic is closed except while the key is held,
     # so room audio and your own speakers can never trigger the agent.

@@ -81,8 +81,16 @@ class PTTListener:
     # is ~30ms) and short enough that letting go still feels instant.
     RELEASE_GRACE = 0.12
 
-    def __init__(self, key="home"):
+    def __init__(self, key="home", pause_key=None, on_pause_toggle=None):
         self._key = resolve_key(key) if isinstance(key, str) else key
+        # A second, independent key (see config.py's pause_key) that just
+        # toggles on each physical press -- no hold/release semantics
+        # needed here, so it gets the same key-repeat filter as the talk
+        # key but none of its release-grace machinery.
+        self._pause_key = (resolve_key(pause_key)
+                           if isinstance(pause_key, str) else pause_key)
+        self._on_pause_toggle = on_pause_toggle
+        self._pause_held = False
         self._held = False
         self._release_t = None          # a release awaiting confirmation
         self._press_evt = threading.Event()
@@ -92,6 +100,12 @@ class PTTListener:
         self._listener.start()
 
     def _on_press(self, k):
+        if self._pause_key is not None and k == self._pause_key:
+            if not self._pause_held:             # filter key-repeat
+                self._pause_held = True
+                if self._on_pause_toggle:
+                    self._on_pause_toggle()
+            return
         if k != self._key:
             return
         # A press cancels any pending release: that release was auto-repeat,
@@ -102,6 +116,9 @@ class PTTListener:
             self._press_evt.set()
 
     def _on_release(self, k):
+        if self._pause_key is not None and k == self._pause_key:
+            self._pause_held = False
+            return
         if k == self._key:
             # PROVISIONAL. Believed only if no press follows; see _settle().
             self._release_t = time.monotonic()

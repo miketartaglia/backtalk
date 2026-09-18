@@ -339,9 +339,18 @@ class Mouth:
         self._stop = threading.Event()
         self._speaking = threading.Event()
         # The one persistent output stream (audio law #1).
-        # Worker-thread-only — never touch from other threads.
+        # Guarded by _out_lock, because switch_device() reopens it from
+        # a different thread than the worker that normally owns it —
+        # see switch_device()'s docstring.
         self._out: sd.OutputStream | None = None
         self._out_rate: int | None = None
+        self._out_lock = threading.Lock()
+        # Pause holds playback instead of dropping it: unlike _stop
+        # (shut_up()'s interrupt), nothing is discarded — the queue and
+        # the in-progress sentence's remaining audio both survive and
+        # pick up exactly where they held.
+        self._resumed = threading.Event()
+        self._resumed.set()
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
@@ -370,11 +379,97 @@ class Mouth:
     def shut_up(self):
         """Barge-in: stop current playback and flush everything queued."""
         self._stop.set()
+        self._resumed.set()   # an interrupt must never leave the NEXT
+                               # reply stuck behind a stale pause
         try:
             while True:
                 self._q.get_nowait()
         except queue.Empty:
             pass
+
+    def pause(self):
+        """Hold playback without discarding anything. The pause key's
+        press calls this; a second press calls resume()."""
+        from backtalk import signals
+        self._resumed.clear()
+        self.ducker.speech_end(debounce=0.0)
+        signals.set_state("paused")
+
+    def resume(self):
+        """Undo pause() — playback continues from exactly where it held."""
+        from backtalk import signals
+        self._resumed.set()
+        if self._speaking.is_set():
+            self.ducker.speech_start()
+        signals.set_state("speaking" if self._speaking.is_set() else "idle")
+
+    def toggle_pause(self):
+        """What the pause key's press calls — one key, two states."""
+        if self._resumed.is_set():
+            self.pause()
+        else:
+            self.resume()
+
+    def switch_device(self, query: str) -> tuple[bool, str]:
+        """Reopen the output stream on a different device, matched by
+        name — "air pods" finds "...AirPods Pro", "speakers" finds
+        "MacBook Pro Speakers". Word-based, not one substring: neither
+        query is a substring of the device name it needs to match, but
+        every query word shows up somewhere in it either way.
+
+        Rescans first (sd._terminate()/_initialize()) to pick up a
+        Bluetooth device that paired after this process started —
+        PortAudio snapshots the device list at init and never sees
+        anything that connected later. This is the one place audio law
+        #1 gets broken on purpose: acceptable because it only runs on
+        an explicit, user-requested switch, never on a normal sentence
+        boundary. No match falls back to the system default rather
+        than refusing, so "switch to speakers" works even if no
+        installed device has that exact word in a longer name.
+        """
+        query = (query or "").strip().lower()
+        if not query:
+            return False, ""
+        query_words = query.split()
+        with self._out_lock:
+            old, self._out = self._out, None
+            rate = self._out_rate or KOKORO_RATE
+            self._out_rate = None
+            if old is not None:
+                try:
+                    old.abort()   # not stop(): a vanished device can hang
+                    old.close()   # a stop() waiting for a drain that never comes
+                except Exception:
+                    pass
+            try:
+                sd._terminate()
+            except Exception:
+                pass               # already down; re-initialising is the point
+            sd._initialize()
+            best: tuple[int, str] | None = None
+            for i, d in enumerate(sd.query_devices()):
+                if d.get("max_output_channels", 0) <= 0:
+                    continue
+                name = d["name"]
+                if all(w in name.lower() for w in query_words):
+                    if best is None or len(name) < len(best[1]):
+                        best = (i, name)
+            index = best[0] if best is not None else None
+            try:
+                new_out = sd.OutputStream(samplerate=rate, channels=1,
+                                          dtype="int16", device=index)
+                new_out.start()
+                self._out = new_out
+                self._out_rate = rate
+            except Exception as e:
+                log(f"[mouth] could not open output device "
+                    f"{(best[1] if best else 'the system default')!r}: {e}")
+        if best is not None:
+            log(f"[mouth] switched output device: {best[1]}")
+        else:
+            log(f"[mouth] no output device matched {query!r} — "
+                f"using the system default")
+        return best is not None, (best[1] if best else "")
 
     def shutdown(self):
         """Exit path: stop playback and restore the music SYNCHRONOUSLY
@@ -419,26 +514,34 @@ class Mouth:
     def _get_out(self, rate: int) -> sd.OutputStream:
         """The long-lived stream (audio law #1). Reopened only when the
         sample rate changes (ElevenLabs 44.1k <-> Kokoro 24k fallback:
-        rare, costs at most one blip on the switch)."""
-        if self._out is not None and self._out_rate == rate:
-            # Guarded, because the stream can die UNDER us: the ears
-            # rebuild the whole audio system to recover from a device
-            # change (see ears._reopen_after_device_change), and that
-            # closes every open stream including this one. Touching a
-            # dead stream raises rather than returning False, so the
-            # check has to be the try, not an `if`. Falling through
-            # rebuilds it, which is what the rest of this method does.
-            try:
-                if not self._out.active:
-                    self._out.start()
-                return self._out
-            except Exception:
-                log("[mouth] the output stream went away, reopening")
-        self._drop_out()
-        self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
-        self._out_rate = rate
-        self._out.start()
-        return self._out
+        rare, costs at most one blip on the switch).
+
+        Locked, because the stream can also be reopened out from under
+        this worker thread by switch_device() running on the console
+        thread — the lock just serializes the two, it never blocks on
+        the actual audio write (that happens on the reference this
+        method RETURNS, outside the lock, in _play_stream)."""
+        with self._out_lock:
+            if self._out is not None and self._out_rate == rate:
+                # Guarded, because the stream can die UNDER us: the ears
+                # rebuild the whole audio system to recover from a device
+                # change (see ears._reopen_after_device_change), and that
+                # closes every open stream including this one. Touching a
+                # dead stream raises rather than returning False, so the
+                # check has to be the try, not an `if`. Falling through
+                # rebuilds it, which is what the rest of this method does.
+                try:
+                    if not self._out.active:
+                        self._out.start()
+                    return self._out
+                except Exception:
+                    log("[mouth] the output stream went away, reopening")
+            self._drop_out_locked()
+            self._out = sd.OutputStream(samplerate=rate, channels=1,
+                                        dtype="int16")
+            self._out_rate = rate
+            self._out.start()
+            return self._out
 
     def _cut(self):
         """Barge-in cut: stop feeding audio and pad the line with a beat
@@ -457,6 +560,11 @@ class Mouth:
         """Close and forget the stream — the next sentence reopens
         fresh. The self-heal path for device errors (interface
         unplugged, audio mixer restarted)."""
+        with self._out_lock:
+            self._drop_out_locked()
+
+    def _drop_out_locked(self):
+        """_drop_out()'s body, for callers that already hold _out_lock."""
         if self._out is not None:
             try:
                 self._out.close(ignore_errors=True)
@@ -494,6 +602,15 @@ class Mouth:
 
             def _write(pcm):
                 for i in range(0, len(pcm), block):
+                    # Gate the DEVICE WRITE, not the synth loop above —
+                    # gating synthesis too could exceed the TTS HTTP
+                    # timeout on a long pause. Still checks _stop on
+                    # every poll, so a barge-in during a pause interrupts
+                    # rather than getting stuck behind it.
+                    while not self._resumed.is_set():
+                        if self._stop.is_set():
+                            return False
+                        self._resumed.wait(timeout=0.1)
                     if self._stop.is_set():
                         return False
                     out.write(pcm[i:i + block])

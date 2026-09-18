@@ -82,6 +82,68 @@ _mic_checked = False
 
 _mic_device_warned = False
 
+# A live device switch (see switch_device() below) overrides mic_device
+# for the rest of the process — set by "switch to air pods"/"switch to
+# speakers" landing on the input side too, so the mic actually follows
+# the speaker switch instead of staying on whatever it already had.
+_mic_override_index: int | None = None
+_mic_override_name: str = ""
+
+# Words that describe the OUTPUT side of a switch request and would
+# never appear in a microphone's name — dropped when matching input
+# devices (symmetric with mouth.py's matching). A query that's ENTIRELY
+# output-only words (i.e. just "speakers") falls back to this hint
+# rather than the stripped-to-nothing original: "MacBook Pro Microphone"
+# shares no word with "speakers" at all, so without this a bare "switch
+# to speakers" would silently leave the mic wherever it was instead of
+# following it back to the built-in pair — the exact case the command
+# exists for.
+_OUTPUT_ONLY_WORDS = {"speaker", "speakers"}
+_BUILTIN_MIC_HINT = ["macbook"]
+
+
+def switch_device(query: str) -> tuple[bool, str]:
+    """Point future mic opens at a different input device, matched by
+    name. Doesn't touch a stream that's already open — both push-to-talk
+    and open-mic close and reopen the mic fresh on every capture anyway
+    (see record_held/_open_mic), so the new device takes effect on the
+    very next one, no live swap needed.
+
+    Deliberately does NOT rescan devices itself
+    (sd._terminate()/_initialize()) — mouth.switch_device() already does
+    that dance to pick up a newly-paired Bluetooth device, and doing it
+    a second time here would invalidate the output stream mouth just
+    opened, since that call tears down the entire PortAudio session, not
+    just one stream. Callers must run mouth's switch first and this
+    one second, same order voice-line established.
+    """
+    global _mic_override_index, _mic_override_name, _mic_device_warned
+    query = (query or "").strip().lower()
+    if not query:
+        return False, ""
+    query_words = query.split()
+    match_words = [w for w in query_words if w not in _OUTPUT_ONLY_WORDS] \
+        or _BUILTIN_MIC_HINT
+    try:
+        devices = sd.query_devices()
+    except Exception as e:
+        log(f"[ears] could not list audio devices ({e})")
+        return False, ""
+    ins = [(i, d) for i, d in enumerate(devices)
+           if d.get("max_input_channels", 0) > 0]
+    best: tuple[int, str] | None = None
+    for i, d in ins:
+        name = d["name"]
+        if match_words and all(w in name.lower() for w in match_words):
+            if best is None or len(name) < len(best[1]):
+                best = (i, name)
+    if best is None:
+        return False, ""
+    _mic_override_index, _mic_override_name = best
+    _mic_device_warned = False
+    log(f"[ears] switched input device: {best[1]}")
+    return True, best[1]
+
 
 def _mic_index():
     """Resolve mic_device (a device NAME) to an index, or None for the default.
@@ -97,6 +159,8 @@ def _mic_index():
     substring, so a precise name can never be beaten by a loose one.
     """
     global _mic_device_warned
+    if _mic_override_index is not None:
+        return _mic_override_index
     want = str(CFG.get("mic_device", "") or "").strip()
     if not want:
         return None
